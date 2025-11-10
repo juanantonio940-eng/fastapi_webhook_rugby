@@ -410,8 +410,13 @@ def fetch_last_messages(icloud_user: str, icloud_pass: str, target_email: str, l
             # Agregar si encontramos datos
             if otp_code or activation_url:
                 try:
-                    imap.store(msg_id, '+FLAGS', '\\Seen')
-                    logger.info(f"✅ Mensaje marcado como LEÍDO")
+                    # Marcar como leído
+                    status, response = imap.store(msg_id, '+FLAGS', '\\Seen')
+                    logger.info(f"📝 Store status: {status}")
+                    
+                    # CRÍTICO: Expunge para persistir cambios en iCloud
+                    imap.expunge()
+                    logger.info(f"✅ Mensaje {msg_id} marcado como LEÍDO y persistido")
                 except Exception as e:
                     logger.warning(f"⚠️ Error marcando como leído: {e}")
                 
@@ -432,6 +437,13 @@ def fetch_last_messages(icloud_user: str, icloud_pass: str, target_email: str, l
             logger.error(f"❌ Error parseando: {e}")
             continue
 
+    # Cerrar carpeta antes de logout
+    try:
+        imap.close()
+        logger.info("✅ INBOX cerrado correctamente")
+    except Exception as e:
+        logger.warning(f"⚠️ Error cerrando INBOX: {e}")
+    
     imap.logout()
     logger.info(f"📊 Total procesados: {len(found_messages)}")
     return found_messages
