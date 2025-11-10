@@ -6,6 +6,7 @@ from typing import List, Optional
 import logging
 from datetime import datetime
 import re
+from html.parser import HTMLParser
 
 import psycopg2
 from psycopg2.extras import RealDictCursor
@@ -45,6 +46,25 @@ class Message(BaseModel):
 class WebhookResponse(BaseModel):
     email: str
     messages: List[Message]
+
+
+# ------- HTML Parser para extraer enlaces -------
+
+class LinkExtractor(HTMLParser):
+    def __init__(self):
+        super().__init__()
+        self.links = []
+        self.in_complete_text = False
+        
+    def handle_starttag(self, tag, attrs):
+        if tag == 'a':
+            for attr, value in attrs:
+                if attr == 'href':
+                    self.links.append(value)
+    
+    def handle_data(self, data):
+        if 'complete your ticketing account' in data.lower():
+            self.in_complete_text = True
 
 
 # ------- HELPERS DB -------
@@ -130,22 +150,46 @@ def extract_otp_code(text: str) -> Optional[str]:
     return None
 
 
-def extract_activation_url(text: str) -> Optional[str]:
+def extract_activation_url(text: str, is_html: bool = False) -> Optional[str]:
     """
-    Extrae la URL de activación que está después del texto "complete your ticketing account".
+    Extrae la URL de activación del email.
+    Si es HTML, extrae enlaces. Si es texto, busca URLs.
     """
     if not text:
         return None
     
-    # Buscar el texto "complete your ticketing account" y la URL siguiente
-    # Primero intentamos encontrar el contexto
+    # Si es HTML, intentar parsear y extraer enlaces
+    if is_html or '<html' in text.lower() or '<a href' in text.lower():
+        logger.info("🔍 Procesando HTML para extraer enlaces")
+        
+        # Extraer todos los enlaces del HTML
+        parser = LinkExtractor()
+        try:
+            parser.feed(text)
+            
+            # Buscar URLs de rugbyworldcup.com
+            for link in parser.links:
+                if 'rugbyworldcup.com' in link.lower():
+                    # Limpiar la URL
+                    url = link.strip()
+                    # Remover posibles caracteres HTML entities
+                    url = url.replace('&amp;', '&')
+                    logger.info(f"🔗 URL de activación encontrada en HTML: {url}")
+                    return url
+        except Exception as e:
+            logger.warning(f"⚠️ Error parseando HTML: {e}")
+    
+    # Buscar en texto plano
+    logger.info("🔍 Buscando URL en texto plano")
+    
+    # Buscar el contexto "complete your ticketing account" y la URL siguiente
     pattern = r'complete your ticketing account.*?(https?://[^\s<>"]+)'
     match = re.search(pattern, text, re.IGNORECASE | re.DOTALL)
     
     if match:
         url = match.group(1)
-        # Limpiar la URL de posibles caracteres finales
         url = url.rstrip('.,;)')
+        url = url.replace('&amp;', '&')
         logger.info(f"🔗 URL de activación encontrada: {url}")
         return url
     
@@ -156,6 +200,7 @@ def extract_activation_url(text: str) -> Optional[str]:
     if match_generic:
         url = match_generic.group(1)
         url = url.rstrip('.,;)')
+        url = url.replace('&amp;', '&')
         logger.info(f"🔗 URL de rugbyworldcup.com encontrada: {url}")
         return url
     
@@ -272,7 +317,7 @@ def fetch_last_messages(icloud_user: str, icloud_pass: str, target_email: str, l
             logger.info(f"📨 Subject: '{subject}'")
             logger.info(f"📨 From: '{from_header}'")
             
-            # Determinar tipo de email
+            # Determinar tipo de email con validación más flexible
             email_type = None
             
             # Verificar si es email de FIFA
@@ -280,11 +325,14 @@ def fetch_last_messages(icloud_user: str, icloud_pass: str, target_email: str, l
                 email_type = "FIFA"
                 logger.info(f"🎯 ¡Encontrado mensaje de FIFA!")
             
-            # Verificar si es email de Rugby World Cup
-            elif "noreplyrwc2027@rugbyworldcup.com" in from_header.lower() and \
-                 "activate your men's rugby world cup 2027 ticketing account" in subject.lower():
-                email_type = "RUGBY"
-                logger.info(f"🏉 ¡Encontrado mensaje de Rugby World Cup 2027!")
+            # Verificar si es email de Rugby World Cup (más flexible)
+            elif "noreplyrwc2027@rugbyworldcup.com" in from_header.lower():
+                # Verificar que el asunto contenga palabras clave de Rugby
+                subject_lower = subject.lower()
+                if ("activate" in subject_lower and "rugby world cup" in subject_lower) or \
+                   "ticketing account" in subject_lower:
+                    email_type = "RUGBY"
+                    logger.info(f"🏉 ¡Encontrado mensaje de Rugby World Cup 2027!")
             
             if not email_type:
                 logger.info(f"⏭️ Saltando mensaje - no es de FIFA ni Rugby")
@@ -349,8 +397,9 @@ def fetch_last_messages(icloud_user: str, icloud_pass: str, target_email: str, l
             
             logger.info(f"📧 Email parseado - Subject: '{subject_full}', From: '{from_}', To: '{to_}'")
 
-            # Extraer el body (texto plano o HTML)
-            body = ""
+            # Extraer el body (texto plano y HTML)
+            body_text = ""
+            body_html = ""
             
             if msg.is_multipart():
                 logger.info("📄 Mensaje es multipart")
@@ -358,63 +407,69 @@ def fetch_last_messages(icloud_user: str, icloud_pass: str, target_email: str, l
                     content_type = part.get_content_type()
                     content_disposition = str(part.get("Content-Disposition", ""))
                     
-                    # Primero intentar con text/plain
                     if content_type == "text/plain" and "attachment" not in content_disposition:
                         payload = part.get_payload(decode=True)
                         if payload:
                             try:
-                                body = payload.decode(errors="ignore")
-                                logger.info(f"✅ Body text/plain extraído, tamaño: {len(body)} chars")
-                                break
+                                body_text = payload.decode(errors="ignore")
+                                logger.info(f"✅ Body text/plain extraído, tamaño: {len(body_text)} chars")
                             except Exception as e:
                                 logger.warning(f"⚠️ Error decodificando text/plain: {e}")
                     
-                    # Si no hay text/plain, usar text/html
-                    elif content_type == "text/html" and "attachment" not in content_disposition and not body:
+                    elif content_type == "text/html" and "attachment" not in content_disposition:
                         payload = part.get_payload(decode=True)
                         if payload:
                             try:
-                                body = payload.decode(errors="ignore")
-                                logger.info(f"✅ Body text/html extraído, tamaño: {len(body)} chars")
+                                body_html = payload.decode(errors="ignore")
+                                logger.info(f"✅ Body text/html extraído, tamaño: {len(body_html)} chars")
                             except Exception as e:
                                 logger.warning(f"⚠️ Error decodificando text/html: {e}")
             else:
                 logger.info("📄 Mensaje es single-part")
                 content_type = msg.get_content_type()
                 
-                if content_type in ["text/plain", "text/html"]:
-                    payload = msg.get_payload(decode=True)
-                    if payload:
-                        try:
-                            body = payload.decode(errors="ignore")
-                            logger.info(f"✅ Body {content_type} extraído, tamaño: {len(body)} chars")
-                        except Exception as e:
-                            body = str(payload)
-                            logger.warning(f"⚠️ Error decodificando body: {e}")
+                payload = msg.get_payload(decode=True)
+                if payload:
+                    try:
+                        if content_type == "text/plain":
+                            body_text = payload.decode(errors="ignore")
+                            logger.info(f"✅ Body text/plain extraído, tamaño: {len(body_text)} chars")
+                        elif content_type == "text/html":
+                            body_html = payload.decode(errors="ignore")
+                            logger.info(f"✅ Body text/html extraído, tamaño: {len(body_html)} chars")
+                    except Exception as e:
+                        logger.warning(f"⚠️ Error decodificando body: {e}")
 
-            if not body:
+            if not body_text and not body_html:
                 logger.warning(f"⚠️ No se pudo extraer body del mensaje")
-                body = str(msg.get_payload())
+                continue
 
             # Extraer información según el tipo de email
             otp_code = None
             activation_url = None
             
             if email_type == "FIFA":
-                otp_code = extract_otp_code(body)
+                otp_code = extract_otp_code(body_text or body_html)
                 if otp_code:
                     logger.info(f"🎉 Código OTP extraído: {otp_code}")
                 else:
                     logger.warning(f"⚠️ No se encontró código OTP")
-                    logger.info(f"📝 Primeros 500 chars del body: {body[:500]}")
             
             elif email_type == "RUGBY":
-                activation_url = extract_activation_url(body)
+                # Intentar primero con HTML, luego con texto
+                if body_html:
+                    activation_url = extract_activation_url(body_html, is_html=True)
+                if not activation_url and body_text:
+                    activation_url = extract_activation_url(body_text, is_html=False)
+                
                 if activation_url:
                     logger.info(f"🎉 URL de activación extraída: {activation_url}")
                 else:
                     logger.warning(f"⚠️ No se encontró URL de activación")
-                    logger.info(f"📝 Primeros 500 chars del body: {body[:500]}")
+                    if body_text:
+                        logger.info(f"📝 Primeros 1000 chars del texto: {body_text[:1000]}")
+                    if body_html:
+                        logger.info(f"📝 Primeros 1000 chars del HTML: {body_html[:1000]}")
             
             # Solo agregar si encontramos OTP o URL
             if otp_code or activation_url:
