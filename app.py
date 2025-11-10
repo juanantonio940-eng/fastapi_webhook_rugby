@@ -6,7 +6,6 @@ from typing import List, Optional
 import logging
 from datetime import datetime
 import re
-from html.parser import HTMLParser
 
 import psycopg2
 from psycopg2.extras import RealDictCursor
@@ -46,25 +45,6 @@ class Message(BaseModel):
 class WebhookResponse(BaseModel):
     email: str
     messages: List[Message]
-
-
-# ------- HTML Parser para extraer enlaces -------
-
-class LinkExtractor(HTMLParser):
-    def __init__(self):
-        super().__init__()
-        self.links = []
-        self.in_complete_text = False
-        
-    def handle_starttag(self, tag, attrs):
-        if tag == 'a':
-            for attr, value in attrs:
-                if attr == 'href':
-                    self.links.append(value)
-    
-    def handle_data(self, data):
-        if 'complete your ticketing account' in data.lower():
-            self.in_complete_text = True
 
 
 # ------- HELPERS DB -------
@@ -126,17 +106,15 @@ def decode_header_part(value: Optional[str]) -> str:
 def extract_otp_code(text: str) -> Optional[str]:
     """
     Extrae el código OTP de 6 dígitos del texto del email.
-    Busca patrones como: 123456, o "código: 123456", etc.
     """
     if not text:
         return None
     
-    # Buscar 6 dígitos consecutivos
     patterns = [
-        r'código[:\s]+(\d{6})',  # código: 123456
-        r'code[:\s]+(\d{6})',     # code: 123456
-        r'verification[:\s]+(\d{6})',  # verification: 123456
-        r'\b(\d{6})\b',           # cualquier número de 6 dígitos aislado
+        r'código[:\s]+(\d{6})',
+        r'code[:\s]+(\d{6})',
+        r'verification[:\s]+(\d{6})',
+        r'\b(\d{6})\b',
     ]
     
     for pattern in patterns:
@@ -146,79 +124,73 @@ def extract_otp_code(text: str) -> Optional[str]:
             logger.info(f"🔑 OTP encontrado: {otp}")
             return otp
     
-    logger.warning("⚠️ No se encontró código OTP en el texto")
+    logger.warning("⚠️ No se encontró código OTP")
     return None
 
 
-def extract_activation_url(text: str, is_html: bool = False) -> Optional[str]:
+def extract_activation_url(text: str) -> Optional[str]:
     """
     Extrae la URL de activación del email.
-    Si es HTML, extrae enlaces. Si es texto, busca URLs.
     """
     if not text:
         return None
     
-    # Si es HTML, intentar parsear y extraer enlaces
-    if is_html or '<html' in text.lower() or '<a href' in text.lower():
-        logger.info("🔍 Procesando HTML para extraer enlaces")
-        
-        # Extraer todos los enlaces del HTML
-        parser = LinkExtractor()
-        try:
-            parser.feed(text)
+    logger.info("🔍 Buscando URL de activación...")
+    
+    # Patrones para buscar URLs de activación (del más específico al más genérico)
+    patterns = [
+        # URL específica de tmtickets con ActivateAccount
+        r'(https://rwc2027\.tmtickets\.co\.uk/Authentication/ActivateAccount/[^\s<>"\']+)',
+        # Cualquier URL de tmtickets
+        r'(https://[^\s<>"\']*tmtickets\.co\.uk[^\s<>"\']*)',
+        # URL de rugbyworldcup con parámetros largos
+        r'(https://rwc2027\.rugbyworldcup\.com/[^\s<>"\']{20,})',
+    ]
+    
+    for pattern in patterns:
+        matches = re.findall(pattern, text, re.IGNORECASE)
+        if matches:
+            # Tomar la URL más larga (probablemente la completa con todos los parámetros)
+            url = max(matches, key=len)
+            # Limpiar la URL
+            url = url.rstrip('.,;)\'"')
+            # Decodificar HTML entities
+            url = url.replace('&amp;', '&')
+            url = url.replace('&quot;', '"')
+            url = url.replace('&#39;', "'")
+            url = url.replace('&lt;', '<')
+            url = url.replace('&gt;', '>')
             
-            # Buscar URLs de rugbyworldcup.com
-            for link in parser.links:
-                if 'rugbyworldcup.com' in link.lower():
-                    # Limpiar la URL
-                    url = link.strip()
-                    # Remover posibles caracteres HTML entities
-                    url = url.replace('&amp;', '&')
-                    logger.info(f"🔗 URL de activación encontrada en HTML: {url}")
-                    return url
-        except Exception as e:
-            logger.warning(f"⚠️ Error parseando HTML: {e}")
+            logger.info(f"🔗 URL de activación encontrada ({len(url)} chars): {url[:100]}...")
+            return url
     
-    # Buscar en texto plano
-    logger.info("🔍 Buscando URL en texto plano")
+    logger.warning("⚠️ No se encontró URL de activación con patrones específicos")
     
-    # Buscar el contexto "complete your ticketing account" y la URL siguiente
-    pattern = r'complete your ticketing account.*?(https?://[^\s<>"]+)'
-    match = re.search(pattern, text, re.IGNORECASE | re.DOTALL)
+    # Último intento: buscar cualquier URL larga
+    all_urls = re.findall(r'https://[^\s<>"\']+', text)
+    if all_urls:
+        # Filtrar URLs largas que probablemente sean de activación
+        long_urls = [url for url in all_urls if len(url) > 100]
+        if long_urls:
+            url = max(long_urls, key=len)
+            url = url.rstrip('.,;)\'"')
+            url = url.replace('&amp;', '&')
+            logger.info(f"🔗 URL larga encontrada ({len(url)} chars): {url[:100]}...")
+            return url
     
-    if match:
-        url = match.group(1)
-        url = url.rstrip('.,;)')
-        url = url.replace('&amp;', '&')
-        logger.info(f"🔗 URL de activación encontrada: {url}")
-        return url
-    
-    # Si no encuentra con el contexto, buscar cualquier URL de rugbyworldcup.com
-    pattern_generic = r'(https?://[^\s<>"]*rugbyworldcup\.com[^\s<>"]*)'
-    match_generic = re.search(pattern_generic, text, re.IGNORECASE)
-    
-    if match_generic:
-        url = match_generic.group(1)
-        url = url.rstrip('.,;)')
-        url = url.replace('&amp;', '&')
-        logger.info(f"🔗 URL de rugbyworldcup.com encontrada: {url}")
-        return url
-    
-    logger.warning("⚠️ No se encontró URL de activación")
+    logger.warning("⚠️ No se encontró ninguna URL de activación")
     return None
 
 
 def extract_recipient_email(header_text: str) -> Optional[str]:
     """
     Extrae el email del destinatario desde los headers.
-    Busca en To:, Delivered-To:, X-Original-To:, etc.
     """
     recipient = None
     
     for line in header_text.split('\n'):
         line_lower = line.lower()
         if line_lower.startswith('delivered-to:') or line_lower.startswith('to:') or line_lower.startswith('x-original-to:'):
-            # Extraer el email de la línea
             email_match = re.search(r'[\w\.-]+@[\w\.-]+\.\w+', line)
             if email_match:
                 recipient = email_match.group(0).lower()
@@ -230,10 +202,7 @@ def extract_recipient_email(header_text: str) -> Optional[str]:
 
 def fetch_last_messages(icloud_user: str, icloud_pass: str, target_email: str, limit: int = 1) -> List[Message]:
     """
-    Conecta con iCloud IMAP y devuelve los últimos N mensajes NO LEÍDOS del día actual que sean:
-    - FIFA ID emails con OTP
-    - Rugby World Cup 2027 emails con URL de activación
-    Marca los mensajes como leídos después de procesarlos.
+    Conecta con iCloud IMAP y devuelve los últimos N mensajes NO LEÍDOS del día actual.
     """
     imap = imaplib.IMAP4_SSL(IMAP_HOST, IMAP_PORT)
     try:
@@ -244,14 +213,12 @@ def fetch_last_messages(icloud_user: str, icloud_pass: str, target_email: str, l
 
     imap.select("INBOX")
 
-    # Obtener fecha de hoy en formato IMAP: DD-Mon-YYYY (ej: 09-Nov-2025)
     today = datetime.now().strftime("%d-%b-%Y")
     logger.info(f"📅 Fecha de hoy: {today}")
     logger.info(f"🎯 Buscando correos para: {target_email}")
     
-    # Buscar mensajes NO LEÍDOS desde hoy
     search_criteria = f'(UNSEEN SINCE {today})'
-    logger.info(f"🔍 Buscando mensajes NO LEÍDOS del día de hoy: {search_criteria}")
+    logger.info(f"🔍 Buscando mensajes NO LEÍDOS: {search_criteria}")
     
     status, data = imap.search(None, search_criteria)
     logger.info(f"📧 Status de búsqueda: {status}")
@@ -264,27 +231,22 @@ def fetch_last_messages(icloud_user: str, icloud_pass: str, target_email: str, l
     unread_ids = data[0].split()
     logger.info(f"📬 Total de mensajes NO LEÍDOS de hoy: {len(unread_ids)}")
     
-    # Procesar de atrás hacia adelante
     found_messages: List[Message] = []
-    
-    # Normalizar el email objetivo para comparación
     target_email_lower = target_email.lower().strip()
     
-    # Invertir la lista para empezar por los más recientes
     for msg_id in reversed(unread_ids):
         if len(found_messages) >= limit:
             break
             
         logger.info(f"📩 Procesando mensaje ID: {msg_id}")
         
-        # Obtener headers completos
+        # Obtener headers
         status, header_data = imap.fetch(msg_id, "(BODY.PEEK[HEADER])")
         
         if status != "OK" or not header_data:
             logger.warning(f"⚠️ Error fetching headers del mensaje {msg_id}")
             continue
         
-        # Extraer headers
         header_bytes = None
         for part in header_data:
             if isinstance(part, tuple) and len(part) >= 2:
@@ -295,14 +257,12 @@ def fetch_last_messages(icloud_user: str, icloud_pass: str, target_email: str, l
                 break
         
         if not header_bytes:
-            logger.warning(f"⚠️ No se pudieron extraer headers del mensaje {msg_id}")
+            logger.warning(f"⚠️ No se pudieron extraer headers")
             continue
         
-        # Parsear los headers
         try:
             header_text = header_bytes.decode('utf-8', errors='ignore')
             
-            # Extraer Subject y From
             subject = ""
             from_header = ""
             
@@ -317,17 +277,13 @@ def fetch_last_messages(icloud_user: str, icloud_pass: str, target_email: str, l
             logger.info(f"📨 Subject: '{subject}'")
             logger.info(f"📨 From: '{from_header}'")
             
-            # Determinar tipo de email con validación más flexible
+            # Determinar tipo de email
             email_type = None
             
-            # Verificar si es email de FIFA
             if "fifa id" in subject.lower():
                 email_type = "FIFA"
                 logger.info(f"🎯 ¡Encontrado mensaje de FIFA!")
-            
-            # Verificar si es email de Rugby World Cup (más flexible)
             elif "noreplyrwc2027@rugbyworldcup.com" in from_header.lower():
-                # Verificar que el asunto contenga palabras clave de Rugby
                 subject_lower = subject.lower()
                 if ("activate" in subject_lower and "rugby world cup" in subject_lower) or \
                    "ticketing account" in subject_lower:
@@ -338,18 +294,16 @@ def fetch_last_messages(icloud_user: str, icloud_pass: str, target_email: str, l
                 logger.info(f"⏭️ Saltando mensaje - no es de FIFA ni Rugby")
                 continue
             
-            # Extraer destinatario del email
             recipient_email = extract_recipient_email(header_text)
             
             if not recipient_email:
                 logger.warning(f"⚠️ No se pudo extraer el email destinatario")
                 continue
             
-            logger.info(f"🔍 Comparando destinatario: '{recipient_email}' vs solicitado: '{target_email_lower}'")
+            logger.info(f"🔍 Comparando: '{recipient_email}' vs '{target_email_lower}'")
             
-            # Verificar que el correo fue enviado al email solicitado
             if recipient_email.lower() != target_email_lower:
-                logger.info(f"⏭️ Saltando mensaje - destinatario '{recipient_email}' no coincide con '{target_email_lower}'")
+                logger.info(f"⏭️ Saltando - destinatario no coincide")
                 continue
             
             logger.info(f"✅ Correo destinado a {target_email_lower} - procesando...")
@@ -358,35 +312,28 @@ def fetch_last_messages(icloud_user: str, icloud_pass: str, target_email: str, l
             logger.warning(f"⚠️ Error parseando headers: {e}")
             continue
         
-        # Ahora obtener el mensaje completo
-        logger.info(f"📥 Obteniendo mensaje completo con BODY[]")
+        # Obtener mensaje completo
+        logger.info(f"📥 Obteniendo mensaje completo")
         status, msg_data = imap.fetch(msg_id, "(BODY[])")
         
         if status != "OK" or not msg_data:
-            logger.warning(f"⚠️ Error fetching mensaje completo {msg_id}")
+            logger.warning(f"⚠️ Error fetching mensaje completo")
             continue
 
-        # Extraer raw_msg
         raw_msg = None
-        
         for part in msg_data:
-            if isinstance(part, tuple):
-                if len(part) >= 2:
-                    if isinstance(part[1], (bytes, bytearray)):
-                        raw_msg = part[1]
-                        logger.info(f"✅ Raw message encontrado, tamaño: {len(raw_msg)} bytes")
-                        break
-            elif isinstance(part, (bytes, bytearray)):
-                if len(part) > 100:
-                    raw_msg = part
-                    logger.info(f"✅ Raw message encontrado directamente, tamaño: {len(raw_msg)} bytes")
+            if isinstance(part, tuple) and len(part) >= 2:
+                if isinstance(part[1], (bytes, bytearray)):
+                    raw_msg = part[1]
                     break
+            elif isinstance(part, (bytes, bytearray)) and len(part) > 100:
+                raw_msg = part
+                break
 
         if not raw_msg:
-            logger.error(f"❌ No se pudo extraer raw_msg del mensaje {msg_id}")
+            logger.error(f"❌ No se pudo extraer raw_msg")
             continue
 
-        # Parsear el mensaje
         try:
             msg = email_lib.message_from_bytes(raw_msg)
 
@@ -395,14 +342,13 @@ def fetch_last_messages(icloud_user: str, icloud_pass: str, target_email: str, l
             to_ = decode_header_part(msg.get("To"))
             date_ = msg.get("Date") or ""
             
-            logger.info(f"📧 Email parseado - Subject: '{subject_full}', From: '{from_}', To: '{to_}'")
+            logger.info(f"📧 Email parseado completo")
 
-            # Extraer el body (texto plano y HTML)
+            # Extraer body
             body_text = ""
             body_html = ""
             
             if msg.is_multipart():
-                logger.info("📄 Mensaje es multipart")
                 for part in msg.walk():
                     content_type = part.get_content_type()
                     content_disposition = str(part.get("Content-Disposition", ""))
@@ -412,73 +358,62 @@ def fetch_last_messages(icloud_user: str, icloud_pass: str, target_email: str, l
                         if payload:
                             try:
                                 body_text = payload.decode(errors="ignore")
-                                logger.info(f"✅ Body text/plain extraído, tamaño: {len(body_text)} chars")
-                            except Exception as e:
-                                logger.warning(f"⚠️ Error decodificando text/plain: {e}")
+                                logger.info(f"✅ Text/plain: {len(body_text)} chars")
+                            except:
+                                pass
                     
                     elif content_type == "text/html" and "attachment" not in content_disposition:
                         payload = part.get_payload(decode=True)
                         if payload:
                             try:
                                 body_html = payload.decode(errors="ignore")
-                                logger.info(f"✅ Body text/html extraído, tamaño: {len(body_html)} chars")
-                            except Exception as e:
-                                logger.warning(f"⚠️ Error decodificando text/html: {e}")
+                                logger.info(f"✅ Text/html: {len(body_html)} chars")
+                            except:
+                                pass
             else:
-                logger.info("📄 Mensaje es single-part")
                 content_type = msg.get_content_type()
-                
                 payload = msg.get_payload(decode=True)
                 if payload:
                     try:
                         if content_type == "text/plain":
                             body_text = payload.decode(errors="ignore")
-                            logger.info(f"✅ Body text/plain extraído, tamaño: {len(body_text)} chars")
                         elif content_type == "text/html":
                             body_html = payload.decode(errors="ignore")
-                            logger.info(f"✅ Body text/html extraído, tamaño: {len(body_html)} chars")
-                    except Exception as e:
-                        logger.warning(f"⚠️ Error decodificando body: {e}")
+                    except:
+                        pass
 
             if not body_text and not body_html:
-                logger.warning(f"⚠️ No se pudo extraer body del mensaje")
+                logger.warning(f"⚠️ No se pudo extraer body")
                 continue
 
-            # Extraer información según el tipo de email
+            # Extraer información
             otp_code = None
             activation_url = None
             
             if email_type == "FIFA":
                 otp_code = extract_otp_code(body_text or body_html)
                 if otp_code:
-                    logger.info(f"🎉 Código OTP extraído: {otp_code}")
-                else:
-                    logger.warning(f"⚠️ No se encontró código OTP")
+                    logger.info(f"🎉 Código OTP: {otp_code}")
             
             elif email_type == "RUGBY":
-                # Intentar primero con HTML, luego con texto
+                # Intentar con HTML primero, luego texto
                 if body_html:
-                    activation_url = extract_activation_url(body_html, is_html=True)
+                    activation_url = extract_activation_url(body_html)
                 if not activation_url and body_text:
-                    activation_url = extract_activation_url(body_text, is_html=False)
+                    activation_url = extract_activation_url(body_text)
                 
                 if activation_url:
-                    logger.info(f"🎉 URL de activación extraída: {activation_url}")
+                    logger.info(f"🎉 URL extraída correctamente")
                 else:
-                    logger.warning(f"⚠️ No se encontró URL de activación")
-                    if body_text:
-                        logger.info(f"📝 Primeros 1000 chars del texto: {body_text[:1000]}")
-                    if body_html:
-                        logger.info(f"📝 Primeros 1000 chars del HTML: {body_html[:1000]}")
+                    logger.warning(f"⚠️ No se encontró URL")
             
-            # Solo agregar si encontramos OTP o URL
+            # Agregar si encontramos datos
             if otp_code or activation_url:
-                # Marcar el mensaje como leído
                 try:
                     imap.store(msg_id, '+FLAGS', '\\Seen')
-                    logger.info(f"✅ Mensaje {msg_id} marcado como LEÍDO")
+                    logger.info(f"✅ Mensaje marcado como LEÍDO")
                 except Exception as e:
-                    logger.warning(f"⚠️ Error marcando mensaje como leído: {e}")
+                    logger.warning(f"⚠️ Error marcando como leído: {e}")
                 
                 found_messages.append(
                     Message(
@@ -491,16 +426,14 @@ def fetch_last_messages(icloud_user: str, icloud_pass: str, target_email: str, l
                         email_type=email_type,
                     )
                 )
-                logger.info(f"✅ Mensaje {email_type} agregado correctamente a la lista")
+                logger.info(f"✅ Mensaje {email_type} agregado")
             
         except Exception as e:
-            logger.error(f"❌ Error parseando mensaje: {e}")
-            import traceback
-            logger.error(traceback.format_exc())
+            logger.error(f"❌ Error parseando: {e}")
             continue
 
     imap.logout()
-    logger.info(f"📊 Total mensajes procesados: {len(found_messages)}")
+    logger.info(f"📊 Total procesados: {len(found_messages)}")
     return found_messages
 
 
@@ -513,32 +446,22 @@ def home():
 
 @app.post("/webhook", response_model=WebhookResponse)
 def handle_webhook(payload: WebhookInput):
-    logger.info(f"🎯 Webhook recibido para email: {payload.email}")
+    logger.info(f"🎯 Webhook recibido para: {payload.email}")
     
-    # 1) Buscar la cuenta en Supabase
     account = get_account(payload.email)
     if not account:
-        logger.error(f"❌ Cuenta no encontrada para {payload.email}")
-        raise HTTPException(
-            status_code=404,
-            detail="Cuenta no encontrada en icloud_accounts para ese email",
-        )
+        logger.error(f"❌ Cuenta no encontrada")
+        raise HTTPException(status_code=404, detail="Cuenta no encontrada")
 
     icloud_user = account["icloud_user"]
     icloud_pass = account["icloud_app_password"]
-    logger.info(f"🔑 Credenciales encontradas para: {icloud_user}")
+    logger.info(f"🔑 Credenciales encontradas")
 
-    # 2) Leer correos de iCloud
     try:
         messages = fetch_last_messages(icloud_user, icloud_pass, payload.email, limit=1)
         logger.info(f"✅ Mensajes obtenidos: {len(messages)}")
-    except imaplib.IMAP4.error as e:
-        logger.error(f"❌ Error IMAP: {e}")
-        raise HTTPException(status_code=401, detail=f"Error autenticando en iCloud: {e}")
     except Exception as e:
-        logger.error(f"❌ Error general: {e}")
-        import traceback
-        logger.error(traceback.format_exc())
-        raise HTTPException(status_code=500, detail=f"Error leyendo correo: {e}")
+        logger.error(f"❌ Error: {e}")
+        raise HTTPException(status_code=500, detail=str(e))
 
     return WebhookResponse(email=payload.email, messages=messages)
