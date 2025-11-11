@@ -231,9 +231,10 @@ def extract_recipient_email(header_text: str) -> Optional[str]:
     return recipient
 
 
-def search_in_folder(imap, folder_name: str, target_email: str, today: str, limit: int = 1, minutes: int = 10) -> List[Message]:
+def search_in_folder(imap, folder_name: str, target_email: str, limit: int = 1, minutes: int = 10, max_emails_to_check: int = 30) -> List[Message]:
     """
     Busca mensajes en una carpeta específica de los últimos N minutos.
+    Solo revisa los últimos max_emails_to_check correos para ser más rápido.
     """
     found_messages: List[Message] = []
     target_email_lower = target_email.lower().strip()
@@ -247,31 +248,45 @@ def search_in_folder(imap, folder_name: str, target_email: str, today: str, limi
         
         logger.info(f"📁 Buscando en carpeta: {folder_name}")
         
-        # Buscar mensajes NO LEÍDOS desde hoy
-        search_criteria = f'(UNSEEN SINCE {today})'
-        logger.info(f"🔍 Criterio de búsqueda: {search_criteria}")
+        # Buscar TODOS los mensajes (no solo UNSEEN, para ser más rápido)
+        # Luego filtraremos por UNSEEN en el procesamiento
+        logger.info(f"🔍 Buscando correos recientes...")
         
-        status, data = imap.search(None, search_criteria)
+        status, data = imap.search(None, "ALL")
         
         if status != "OK" or not data or not data[0]:
-            logger.info(f"⚠️ No se encontraron mensajes no leídos en {folder_name}")
+            logger.info(f"⚠️ No se encontraron mensajes en {folder_name}")
             return []
 
-        unread_ids = data[0].split()
-        logger.info(f"📬 Total de mensajes NO LEÍDOS en {folder_name}: {len(unread_ids)}")
+        all_ids = data[0].split()
+        total_emails = len(all_ids)
+        logger.info(f"📬 Total de mensajes en {folder_name}: {total_emails}")
         
-        # Procesar de atrás hacia adelante
-        for msg_id in reversed(unread_ids):
+        # OPTIMIZACIÓN: Solo revisar los últimos N correos
+        ids_to_check = all_ids[-max_emails_to_check:]
+        logger.info(f"⚡ Revisando solo los últimos {len(ids_to_check)} correos (de {total_emails} totales)")
+        
+        emails_checked = 0
+        
+        # Procesar de atrás hacia adelante (más recientes primero)
+        for msg_id in reversed(ids_to_check):
             if len(found_messages) >= limit:
                 break
-                
-            logger.info(f"📩 Procesando mensaje ID: {msg_id}")
             
-            # Obtener headers
-            status, header_data = imap.fetch(msg_id, "(BODY.PEEK[HEADER])")
+            emails_checked += 1
+            logger.info(f"📩 Procesando mensaje ID: {msg_id} ({emails_checked}/{len(ids_to_check)})")
+            
+            # Obtener headers con FLAGS para verificar si está leído
+            status, header_data = imap.fetch(msg_id, "(FLAGS BODY.PEEK[HEADER])")
             
             if status != "OK" or not header_data:
                 logger.warning(f"⚠️ Error fetching headers del mensaje {msg_id}")
+                continue
+            
+            # Verificar si el mensaje está no leído (UNSEEN)
+            flags_str = str(header_data)
+            if '\\Seen' in flags_str:
+                logger.info(f"⏭️ Saltando - mensaje ya leído")
                 continue
             
             header_bytes = None
@@ -307,6 +322,8 @@ def search_in_folder(imap, folder_name: str, target_email: str, today: str, limi
                 # VERIFICAR SI EL EMAIL ES DE LOS ÚLTIMOS N MINUTOS
                 if not is_within_last_minutes(date_header, minutes):
                     logger.info(f"⏭️ Saltando - email muy antiguo (más de {minutes} minutos)")
+                    # Si encontramos un email antiguo, probablemente los siguientes también lo serán
+                    # Pero seguimos buscando por si hay alguno reciente no leído
                     continue
                 
                 logger.info(f"📨 Subject: '{subject}'")
@@ -473,16 +490,19 @@ def search_in_folder(imap, folder_name: str, target_email: str, today: str, limi
                 logger.error(f"❌ Error parseando: {e}")
                 continue
         
+        logger.info(f"📊 Revisados {emails_checked} correos en {folder_name}")
+        
     except Exception as e:
         logger.error(f"❌ Error en carpeta {folder_name}: {e}")
     
     return found_messages
 
 
-def fetch_last_messages(icloud_user: str, icloud_pass: str, target_email: str, limit: int = 1, minutes: int = 10) -> List[Message]:
+def fetch_last_messages(icloud_user: str, icloud_pass: str, target_email: str, limit: int = 1, minutes: int = 10, max_emails_to_check: int = 30) -> List[Message]:
     """
     Conecta con iCloud IMAP y devuelve los últimos N mensajes NO LEÍDOS de los últimos X minutos.
     Busca en INBOX y en Junk/Spam.
+    Solo revisa los últimos max_emails_to_check correos por carpeta para mayor velocidad.
     """
     imap = imaplib.IMAP4_SSL(IMAP_HOST, IMAP_PORT)
     try:
@@ -491,10 +511,9 @@ def fetch_last_messages(icloud_user: str, icloud_pass: str, target_email: str, l
     except imaplib.IMAP4.error as e:
         raise Exception(f"Error autenticando en iCloud: {e}")
 
-    today = datetime.now().strftime("%d-%b-%Y")
-    logger.info(f"📅 Fecha de hoy: {today}")
     logger.info(f"🎯 Buscando correos para: {target_email}")
     logger.info(f"⏰ Solo emails de los últimos {minutes} minutos")
+    logger.info(f"⚡ Máximo {max_emails_to_check} correos por carpeta")
     
     all_messages: List[Message] = []
     
@@ -506,7 +525,7 @@ def fetch_last_messages(icloud_user: str, icloud_pass: str, target_email: str, l
         logger.info(f"🔍 Revisando carpeta: {folder}")
         logger.info(f"{'='*60}")
         
-        messages = search_in_folder(imap, folder, target_email, today, limit, minutes)
+        messages = search_in_folder(imap, folder, target_email, limit, minutes, max_emails_to_check)
         all_messages.extend(messages)
         
         # Si ya encontramos el límite, parar
@@ -548,7 +567,15 @@ def handle_webhook(payload: WebhookInput):
 
     try:
         # Buscar emails de los últimos 10 minutos
-        messages = fetch_last_messages(icloud_user, icloud_pass, payload.email, limit=1, minutes=10)
+        # Solo revisar los últimos 30 correos por carpeta para ser más rápido
+        messages = fetch_last_messages(
+            icloud_user, 
+            icloud_pass, 
+            payload.email, 
+            limit=1, 
+            minutes=10, 
+            max_emails_to_check=30
+        )
         logger.info(f"✅ Mensajes obtenidos: {len(messages)}")
     except Exception as e:
         logger.error(f"❌ Error: {e}")
