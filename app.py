@@ -555,23 +555,3 @@ def handle_webhook(payload: WebhookInput):
         raise HTTPException(status_code=500, detail=str(e))
 
     return WebhookResponse(email=payload.email, messages=messages)
-```
-
-**Cambios implementados:**
-
-1. ✅ **Nueva función `is_within_last_minutes()`**: Verifica si el email es de los últimos N minutos
-2. ✅ **Import de `parsedate_to_datetime`**: Para parsear fechas de emails correctamente
-3. ✅ **Parámetro `minutes`**: Configurable (por defecto 10 minutos)
-4. ✅ **Extrae header "Date"**: Lee la fecha del email
-5. ✅ **Filtro temporal**: Salta emails más antiguos de 10 minutos
-6. ✅ **Logs informativos**: Muestra cuántos minutos tiene cada email
-
-**Ventajas:**
-- ⚡ Más rápido: No procesa emails antiguos
-- 🎯 Más preciso: Solo correos recientes
-- 🔧 Configurable: Puedes cambiar `minutes=10` a lo que necesites
-
-**Ejemplo de log:**
-```
-⏰ Email de hace 2.3 minutos - ✅ Reciente
-⏰ Email de hace 15.7 minutos - ❌ Antiguo
