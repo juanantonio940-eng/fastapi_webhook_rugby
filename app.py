@@ -574,7 +574,7 @@ def handle_webhook(payload: WebhookInput):
             payload.email, 
             limit=1, 
             minutes=10, 
-            max_emails_to_check=30
+            max_emails_to_check=15
         )
         logger.info(f"✅ Mensajes obtenidos: {len(messages)}")
     except Exception as e:
