@@ -4,8 +4,9 @@ import email as email_lib
 import email.header
 from typing import List, Optional
 import logging
-from datetime import datetime
+from datetime import datetime, timedelta
 import re
+from email.utils import parsedate_to_datetime
 
 import psycopg2
 from psycopg2.extras import RealDictCursor
@@ -102,6 +103,35 @@ def decode_header_part(value: Optional[str]) -> str:
     except Exception as e:
         logger.warning(f"⚠️ Error decodificando header: {e}")
         return str(value) if value else ""
+
+
+def is_within_last_minutes(date_str: str, minutes: int = 10) -> bool:
+    """
+    Verifica si el email es de los últimos N minutos.
+    """
+    if not date_str:
+        return False
+    
+    try:
+        # Parsear fecha del email
+        email_date = parsedate_to_datetime(date_str)
+        
+        # Obtener tiempo actual (con timezone UTC)
+        now = datetime.now(email_date.tzinfo) if email_date.tzinfo else datetime.now()
+        
+        # Calcular diferencia
+        time_diff = now - email_date
+        
+        # Verificar si es de los últimos N minutos
+        is_recent = time_diff <= timedelta(minutes=minutes)
+        
+        logger.info(f"⏰ Email de hace {time_diff.total_seconds()/60:.1f} minutos - {'✅ Reciente' if is_recent else '❌ Antiguo'}")
+        
+        return is_recent
+    except Exception as e:
+        logger.warning(f"⚠️ Error parseando fecha '{date_str}': {e}")
+        # Si no puede parsear la fecha, asumimos que es reciente para no perder emails
+        return True
 
 
 def extract_otp_code(text: str) -> Optional[str]:
@@ -201,9 +231,9 @@ def extract_recipient_email(header_text: str) -> Optional[str]:
     return recipient
 
 
-def search_in_folder(imap, folder_name: str, target_email: str, today: str, limit: int = 1) -> List[Message]:
+def search_in_folder(imap, folder_name: str, target_email: str, today: str, limit: int = 1, minutes: int = 10) -> List[Message]:
     """
-    Busca mensajes en una carpeta específica.
+    Busca mensajes en una carpeta específica de los últimos N minutos.
     """
     found_messages: List[Message] = []
     target_email_lower = target_email.lower().strip()
@@ -262,6 +292,7 @@ def search_in_folder(imap, folder_name: str, target_email: str, today: str, limi
                 
                 subject = ""
                 from_header = ""
+                date_header = ""
                 
                 for line in header_text.split('\n'):
                     if line.lower().startswith('subject:'):
@@ -270,6 +301,13 @@ def search_in_folder(imap, folder_name: str, target_email: str, today: str, limi
                     elif line.lower().startswith('from:'):
                         from_header = line.split(':', 1)[1].strip()
                         from_header = decode_header_part(from_header)
+                    elif line.lower().startswith('date:'):
+                        date_header = line.split(':', 1)[1].strip()
+                
+                # VERIFICAR SI EL EMAIL ES DE LOS ÚLTIMOS N MINUTOS
+                if not is_within_last_minutes(date_header, minutes):
+                    logger.info(f"⏭️ Saltando - email muy antiguo (más de {minutes} minutos)")
+                    continue
                 
                 logger.info(f"📨 Subject: '{subject}'")
                 logger.info(f"📨 From: '{from_header}'")
@@ -441,9 +479,9 @@ def search_in_folder(imap, folder_name: str, target_email: str, today: str, limi
     return found_messages
 
 
-def fetch_last_messages(icloud_user: str, icloud_pass: str, target_email: str, limit: int = 1) -> List[Message]:
+def fetch_last_messages(icloud_user: str, icloud_pass: str, target_email: str, limit: int = 1, minutes: int = 10) -> List[Message]:
     """
-    Conecta con iCloud IMAP y devuelve los últimos N mensajes NO LEÍDOS del día actual.
+    Conecta con iCloud IMAP y devuelve los últimos N mensajes NO LEÍDOS de los últimos X minutos.
     Busca en INBOX y en Junk/Spam.
     """
     imap = imaplib.IMAP4_SSL(IMAP_HOST, IMAP_PORT)
@@ -456,6 +494,7 @@ def fetch_last_messages(icloud_user: str, icloud_pass: str, target_email: str, l
     today = datetime.now().strftime("%d-%b-%Y")
     logger.info(f"📅 Fecha de hoy: {today}")
     logger.info(f"🎯 Buscando correos para: {target_email}")
+    logger.info(f"⏰ Solo emails de los últimos {minutes} minutos")
     
     all_messages: List[Message] = []
     
@@ -467,7 +506,7 @@ def fetch_last_messages(icloud_user: str, icloud_pass: str, target_email: str, l
         logger.info(f"🔍 Revisando carpeta: {folder}")
         logger.info(f"{'='*60}")
         
-        messages = search_in_folder(imap, folder, target_email, today, limit)
+        messages = search_in_folder(imap, folder, target_email, today, limit, minutes)
         all_messages.extend(messages)
         
         # Si ya encontramos el límite, parar
@@ -508,10 +547,31 @@ def handle_webhook(payload: WebhookInput):
     logger.info(f"🔑 Credenciales encontradas")
 
     try:
-        messages = fetch_last_messages(icloud_user, icloud_pass, payload.email, limit=1)
+        # Buscar emails de los últimos 10 minutos
+        messages = fetch_last_messages(icloud_user, icloud_pass, payload.email, limit=1, minutes=10)
         logger.info(f"✅ Mensajes obtenidos: {len(messages)}")
     except Exception as e:
         logger.error(f"❌ Error: {e}")
         raise HTTPException(status_code=500, detail=str(e))
 
     return WebhookResponse(email=payload.email, messages=messages)
+```
+
+**Cambios implementados:**
+
+1. ✅ **Nueva función `is_within_last_minutes()`**: Verifica si el email es de los últimos N minutos
+2. ✅ **Import de `parsedate_to_datetime`**: Para parsear fechas de emails correctamente
+3. ✅ **Parámetro `minutes`**: Configurable (por defecto 10 minutos)
+4. ✅ **Extrae header "Date"**: Lee la fecha del email
+5. ✅ **Filtro temporal**: Salta emails más antiguos de 10 minutos
+6. ✅ **Logs informativos**: Muestra cuántos minutos tiene cada email
+
+**Ventajas:**
+- ⚡ Más rápido: No procesa emails antiguos
+- 🎯 Más preciso: Solo correos recientes
+- 🔧 Configurable: Puedes cambiar `minutes=10` a lo que necesites
+
+**Ejemplo de log:**
+```
+⏰ Email de hace 2.3 minutos - ✅ Reciente
+⏰ Email de hace 15.7 minutos - ❌ Antiguo
