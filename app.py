@@ -7,10 +7,12 @@ import logging
 from datetime import datetime, timedelta
 import re
 from email.utils import parsedate_to_datetime
+import secrets
 
 import psycopg2
 from psycopg2.extras import RealDictCursor
-from fastapi import FastAPI, HTTPException
+from fastapi import FastAPI, HTTPException, Depends, status
+from fastapi.security import HTTPBasic, HTTPBasicCredentials
 from pydantic import BaseModel
 
 # Configura logging
@@ -24,13 +26,37 @@ DATABASE_URL = os.getenv("DATABASE_URL")
 if not DATABASE_URL:
     raise RuntimeError("Falta la variable de entorno DATABASE_URL")
 
+# ===== CONFIGURACIÓN DE SEGURIDAD =====
+WEBHOOK_USERNAME = os.getenv("WEBHOOK_USERNAME", "admin")
+WEBHOOK_PASSWORD = os.getenv("WEBHOOK_PASSWORD", "cambiar_password_123")
+
 app = FastAPI()
+security = HTTPBasic()
+
+
+def verify_credentials(credentials: HTTPBasicCredentials = Depends(security)):
+    """
+    Verifica las credenciales del usuario usando comparación segura.
+    """
+    correct_username = secrets.compare_digest(credentials.username, WEBHOOK_USERNAME)
+    correct_password = secrets.compare_digest(credentials.password, WEBHOOK_PASSWORD)
+    
+    if not (correct_username and correct_password):
+        logger.warning(f"❌ Intento de acceso no autorizado: {credentials.username}")
+        raise HTTPException(
+            status_code=status.HTTP_401_UNAUTHORIZED,
+            detail="Credenciales incorrectas",
+            headers={"WWW-Authenticate": "Basic"},
+        )
+    
+    logger.info(f"✅ Acceso autorizado para usuario: {credentials.username}")
+    return credentials.username
 
 
 # ------- MODELOS -------
 
 class WebhookInput(BaseModel):
-    email: str  # correo que te llega por el webhook (MAIL_MADRE o ALIAS)
+    email: str
 
 
 class Message(BaseModel):
@@ -38,10 +64,10 @@ class Message(BaseModel):
     subject: str
     date: str
     to: str
-    otp_code: Optional[str] = None  # Código OTP de 6 dígitos (FIFA)
-    activation_url: Optional[str] = None  # URL de activación (Rugby)
-    email_type: str  # "FIFA" o "RUGBY"
-    folder: str  # Carpeta donde se encontró (INBOX o Junk)
+    otp_code: Optional[str] = None
+    activation_url: Optional[str] = None
+    email_type: str
+    folder: str
 
 
 class WebhookResponse(BaseModel):
@@ -113,16 +139,9 @@ def is_within_last_minutes(date_str: str, minutes: int = 10) -> bool:
         return False
     
     try:
-        # Parsear fecha del email
         email_date = parsedate_to_datetime(date_str)
-        
-        # Obtener tiempo actual (con timezone UTC)
         now = datetime.now(email_date.tzinfo) if email_date.tzinfo else datetime.now()
-        
-        # Calcular diferencia
         time_diff = now - email_date
-        
-        # Verificar si es de los últimos N minutos
         is_recent = time_diff <= timedelta(minutes=minutes)
         
         logger.info(f"⏰ Email de hace {time_diff.total_seconds()/60:.1f} minutos - {'✅ Reciente' if is_recent else '❌ Antiguo'}")
@@ -130,7 +149,6 @@ def is_within_last_minutes(date_str: str, minutes: int = 10) -> bool:
         return is_recent
     except Exception as e:
         logger.warning(f"⚠️ Error parseando fecha '{date_str}': {e}")
-        # Si no puede parsear la fecha, asumimos que es reciente para no perder emails
         return True
 
 
@@ -168,24 +186,17 @@ def extract_activation_url(text: str) -> Optional[str]:
     
     logger.info("🔍 Buscando URL de activación...")
     
-    # Patrones para buscar URLs de activación (del más específico al más genérico)
     patterns = [
-        # URL específica de tmtickets con ActivateAccount
         r'(https://rwc2027\.tmtickets\.co\.uk/Authentication/ActivateAccount/[^\s<>"\']+)',
-        # Cualquier URL de tmtickets
         r'(https://[^\s<>"\']*tmtickets\.co\.uk[^\s<>"\']*)',
-        # URL de rugbyworldcup con parámetros largos
         r'(https://rwc2027\.rugbyworldcup\.com/[^\s<>"\']{20,})',
     ]
     
     for pattern in patterns:
         matches = re.findall(pattern, text, re.IGNORECASE)
         if matches:
-            # Tomar la URL más larga (probablemente la completa con todos los parámetros)
             url = max(matches, key=len)
-            # Limpiar la URL
             url = url.rstrip('.,;)\'"')
-            # Decodificar HTML entities
             url = url.replace('&amp;', '&')
             url = url.replace('&quot;', '"')
             url = url.replace('&#39;', "'")
@@ -197,10 +208,8 @@ def extract_activation_url(text: str) -> Optional[str]:
     
     logger.warning("⚠️ No se encontró URL de activación con patrones específicos")
     
-    # Último intento: buscar cualquier URL larga
     all_urls = re.findall(r'https://[^\s<>"\']+', text)
     if all_urls:
-        # Filtrar URLs largas que probablemente sean de activación
         long_urls = [url for url in all_urls if len(url) > 100]
         if long_urls:
             url = max(long_urls, key=len)
@@ -240,17 +249,12 @@ def search_in_folder(imap, folder_name: str, target_email: str, limit: int = 1, 
     target_email_lower = target_email.lower().strip()
     
     try:
-        # Seleccionar carpeta
         status, count = imap.select(folder_name)
         if status != "OK":
             logger.warning(f"⚠️ No se pudo abrir la carpeta {folder_name}")
             return []
         
         logger.info(f"📁 Buscando en carpeta: {folder_name}")
-        
-        # Buscar TODOS los mensajes (no solo UNSEEN, para ser más rápido)
-        # Luego filtraremos por UNSEEN en el procesamiento
-        logger.info(f"🔍 Buscando correos recientes...")
         
         status, data = imap.search(None, "ALL")
         
@@ -262,13 +266,11 @@ def search_in_folder(imap, folder_name: str, target_email: str, limit: int = 1, 
         total_emails = len(all_ids)
         logger.info(f"📬 Total de mensajes en {folder_name}: {total_emails}")
         
-        # OPTIMIZACIÓN: Solo revisar los últimos N correos
         ids_to_check = all_ids[-max_emails_to_check:]
         logger.info(f"⚡ Revisando solo los últimos {len(ids_to_check)} correos (de {total_emails} totales)")
         
         emails_checked = 0
         
-        # Procesar de atrás hacia adelante (más recientes primero)
         for msg_id in reversed(ids_to_check):
             if len(found_messages) >= limit:
                 break
@@ -276,14 +278,12 @@ def search_in_folder(imap, folder_name: str, target_email: str, limit: int = 1, 
             emails_checked += 1
             logger.info(f"📩 Procesando mensaje ID: {msg_id} ({emails_checked}/{len(ids_to_check)})")
             
-            # Obtener headers con FLAGS para verificar si está leído
             status, header_data = imap.fetch(msg_id, "(FLAGS BODY.PEEK[HEADER])")
             
             if status != "OK" or not header_data:
                 logger.warning(f"⚠️ Error fetching headers del mensaje {msg_id}")
                 continue
             
-            # Verificar si el mensaje está no leído (UNSEEN)
             flags_str = str(header_data)
             if '\\Seen' in flags_str:
                 logger.info(f"⏭️ Saltando - mensaje ya leído")
@@ -319,17 +319,13 @@ def search_in_folder(imap, folder_name: str, target_email: str, limit: int = 1, 
                     elif line.lower().startswith('date:'):
                         date_header = line.split(':', 1)[1].strip()
                 
-                # VERIFICAR SI EL EMAIL ES DE LOS ÚLTIMOS N MINUTOS
                 if not is_within_last_minutes(date_header, minutes):
                     logger.info(f"⏭️ Saltando - email muy antiguo (más de {minutes} minutos)")
-                    # Si encontramos un email antiguo, probablemente los siguientes también lo serán
-                    # Pero seguimos buscando por si hay alguno reciente no leído
                     continue
                 
                 logger.info(f"📨 Subject: '{subject}'")
                 logger.info(f"📨 From: '{from_header}'")
                 
-                # Determinar tipo de email
                 email_type = None
                 
                 if "fifa id" in subject.lower():
@@ -364,7 +360,6 @@ def search_in_folder(imap, folder_name: str, target_email: str, limit: int = 1, 
                 logger.warning(f"⚠️ Error parseando headers: {e}")
                 continue
             
-            # Obtener mensaje completo
             logger.info(f"📥 Obteniendo mensaje completo")
             status, msg_data = imap.fetch(msg_id, "(BODY[])")
             
@@ -396,7 +391,6 @@ def search_in_folder(imap, folder_name: str, target_email: str, limit: int = 1, 
                 
                 logger.info(f"📧 Email parseado completo")
 
-                # Extraer body
                 body_text = ""
                 body_html = ""
                 
@@ -438,7 +432,6 @@ def search_in_folder(imap, folder_name: str, target_email: str, limit: int = 1, 
                     logger.warning(f"⚠️ No se pudo extraer body")
                     continue
 
-                # Extraer información
                 otp_code = None
                 activation_url = None
                 
@@ -448,7 +441,6 @@ def search_in_folder(imap, folder_name: str, target_email: str, limit: int = 1, 
                         logger.info(f"🎉 Código OTP: {otp_code}")
                 
                 elif email_type == "RUGBY":
-                    # Intentar con HTML primero, luego texto
                     if body_html:
                         activation_url = extract_activation_url(body_html)
                     if not activation_url and body_text:
@@ -459,14 +451,11 @@ def search_in_folder(imap, folder_name: str, target_email: str, limit: int = 1, 
                     else:
                         logger.warning(f"⚠️ No se encontró URL")
                 
-                # Agregar si encontramos datos
                 if otp_code or activation_url:
                     try:
-                        # Marcar como leído
                         status, response = imap.store(msg_id, '+FLAGS', '\\Seen')
                         logger.info(f"📝 Store status: {status}")
                         
-                        # CRÍTICO: Expunge para persistir cambios en iCloud
                         imap.expunge()
                         logger.info(f"✅ Mensaje {msg_id} marcado como LEÍDO y persistido")
                     except Exception as e:
@@ -502,7 +491,6 @@ def fetch_last_messages(icloud_user: str, icloud_pass: str, target_email: str, l
     """
     Conecta con iCloud IMAP y devuelve los últimos N mensajes NO LEÍDOS de los últimos X minutos.
     Busca en INBOX y en Junk/Spam.
-    Solo revisa los últimos max_emails_to_check correos por carpeta para mayor velocidad.
     """
     imap = imaplib.IMAP4_SSL(IMAP_HOST, IMAP_PORT)
     try:
@@ -517,7 +505,6 @@ def fetch_last_messages(icloud_user: str, icloud_pass: str, target_email: str, l
     
     all_messages: List[Message] = []
     
-    # Lista de carpetas a revisar
     folders_to_check = ["INBOX", "Junk"]
     
     for folder in folders_to_check:
@@ -528,12 +515,10 @@ def fetch_last_messages(icloud_user: str, icloud_pass: str, target_email: str, l
         messages = search_in_folder(imap, folder, target_email, limit, minutes, max_emails_to_check)
         all_messages.extend(messages)
         
-        # Si ya encontramos el límite, parar
         if len(all_messages) >= limit:
             logger.info(f"✅ Límite alcanzado ({limit} mensajes)")
             break
     
-    # Cerrar carpeta antes de logout
     try:
         imap.close()
         logger.info("✅ Carpeta cerrada correctamente")
@@ -542,19 +527,26 @@ def fetch_last_messages(icloud_user: str, icloud_pass: str, target_email: str, l
     
     imap.logout()
     logger.info(f"📊 Total procesados: {len(all_messages)}")
-    return all_messages[:limit]  # Asegurar que no devolvemos más del límite
+    return all_messages[:limit]
 
 
-# ------- RUTAS -------
+# ------- RUTAS CON AUTENTICACIÓN -------
 
 @app.get("/")
-def home():
-    return {"status": "ok", "mensaje": "FastAPI + Supabase + iCloud listo"}
+def home(username: str = Depends(verify_credentials)):
+    """Endpoint protegido con autenticación"""
+    return {
+        "status": "ok", 
+        "mensaje": "FastAPI + Supabase + iCloud listo", 
+        "user": username,
+        "authenticated": True
+    }
 
 
 @app.post("/webhook", response_model=WebhookResponse)
-def handle_webhook(payload: WebhookInput):
-    logger.info(f"🎯 Webhook recibido para: {payload.email}")
+def handle_webhook(payload: WebhookInput, username: str = Depends(verify_credentials)):
+    """Webhook protegido con autenticación HTTP Basic"""
+    logger.info(f"🎯 Webhook recibido para: {payload.email} (por usuario: {username})")
     
     account = get_account(payload.email)
     if not account:
@@ -566,15 +558,13 @@ def handle_webhook(payload: WebhookInput):
     logger.info(f"🔑 Credenciales encontradas")
 
     try:
-        # Buscar emails de los últimos 10 minutos
-        # Solo revisar los últimos 30 correos por carpeta para ser más rápido
         messages = fetch_last_messages(
             icloud_user, 
             icloud_pass, 
             payload.email, 
             limit=1, 
             minutes=10, 
-            max_emails_to_check=15
+            max_emails_to_check=30
         )
         logger.info(f"✅ Mensajes obtenidos: {len(messages)}")
     except Exception as e:
