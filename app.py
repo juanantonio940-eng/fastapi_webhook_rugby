@@ -7,12 +7,11 @@ import logging
 from datetime import datetime, timedelta
 import re
 from email.utils import parsedate_to_datetime
-import secrets
 
 import psycopg2
 from psycopg2.extras import RealDictCursor
-from fastapi import FastAPI, HTTPException, Depends, status
-from fastapi.security import HTTPBasic, HTTPBasicCredentials
+from fastapi import FastAPI, HTTPException
+from fastapi.responses import PlainTextResponse
 from pydantic import BaseModel
 
 # Configura logging
@@ -26,31 +25,7 @@ DATABASE_URL = os.getenv("DATABASE_URL")
 if not DATABASE_URL:
     raise RuntimeError("Falta la variable de entorno DATABASE_URL")
 
-# ===== CONFIGURACIÓN DE SEGURIDAD =====
-WEBHOOK_USERNAME = os.getenv("WEBHOOK_USERNAME", "admin")
-WEBHOOK_PASSWORD = os.getenv("WEBHOOK_PASSWORD", "cambiar_password_123")
-
 app = FastAPI()
-security = HTTPBasic()
-
-
-def verify_credentials(credentials: HTTPBasicCredentials = Depends(security)):
-    """
-    Verifica las credenciales del usuario usando comparación segura.
-    """
-    correct_username = secrets.compare_digest(credentials.username, WEBHOOK_USERNAME)
-    correct_password = secrets.compare_digest(credentials.password, WEBHOOK_PASSWORD)
-    
-    if not (correct_username and correct_password):
-        logger.warning(f"❌ Intento de acceso no autorizado: {credentials.username}")
-        raise HTTPException(
-            status_code=status.HTTP_401_UNAUTHORIZED,
-            detail="Credenciales incorrectas",
-            headers={"WWW-Authenticate": "Basic"},
-        )
-    
-    logger.info(f"✅ Acceso autorizado para usuario: {credentials.username}")
-    return credentials.username
 
 
 # ------- MODELOS -------
@@ -530,23 +505,76 @@ def fetch_last_messages(icloud_user: str, icloud_pass: str, target_email: str, l
     return all_messages[:limit]
 
 
-# ------- RUTAS CON AUTENTICACIÓN -------
+# ------- RUTAS -------
 
 @app.get("/")
-def home(username: str = Depends(verify_credentials)):
-    """Endpoint protegido con autenticación"""
-    return {
-        "status": "ok", 
-        "mensaje": "FastAPI + Supabase + iCloud listo", 
-        "user": username,
-        "authenticated": True
-    }
+def home():
+    return {"status": "ok", "mensaje": "FastAPI + Supabase + iCloud listo"}
 
 
-@app.post("/webhook", response_model=WebhookResponse)
-def handle_webhook(payload: WebhookInput, username: str = Depends(verify_credentials)):
-    """Webhook protegido con autenticación HTTP Basic"""
-    logger.info(f"🎯 Webhook recibido para: {payload.email} (por usuario: {username})")
+@app.post("/webhook", response_class=PlainTextResponse)
+def handle_webhook(payload: WebhookInput):
+    """
+    Webhook que devuelve SOLO el código OTP o URL como texto plano.
+    Respuestas posibles:
+    - "276388" (código OTP de FIFA)
+    - "https://rwc2027.tmtickets.co.uk/..." (URL de Rugby)
+    - "ERROR: No se encontraron mensajes"
+    - "ERROR: Cuenta no encontrada"
+    """
+    logger.info(f"🎯 Webhook recibido para: {payload.email}")
+    
+    account = get_account(payload.email)
+    if not account:
+        logger.error(f"❌ Cuenta no encontrada")
+        return "ERROR: Cuenta no encontrada"
+
+    icloud_user = account["icloud_user"]
+    icloud_pass = account["icloud_app_password"]
+    logger.info(f"🔑 Credenciales encontradas")
+
+    try:
+        messages = fetch_last_messages(
+            icloud_user, 
+            icloud_pass, 
+            payload.email, 
+            limit=1, 
+            minutes=10, 
+            max_emails_to_check=30
+        )
+        logger.info(f"✅ Mensajes obtenidos: {len(messages)}")
+        
+        # Si no hay mensajes
+        if not messages:
+            return "ERROR: No se encontraron mensajes"
+        
+        # Obtener el primer mensaje
+        msg = messages[0]
+        
+        # Si es FIFA, devolver el código OTP
+        if msg.otp_code:
+            logger.info(f"🎉 Devolviendo OTP: {msg.otp_code}")
+            return msg.otp_code
+        
+        # Si es Rugby, devolver la URL
+        if msg.activation_url:
+            logger.info(f"🎉 Devolviendo URL: {msg.activation_url}")
+            return msg.activation_url
+        
+        # Si no tiene ni OTP ni URL
+        return "ERROR: Mensaje encontrado pero sin código ni URL"
+        
+    except Exception as e:
+        logger.error(f"❌ Error: {e}")
+        return f"ERROR: {str(e)}"
+
+
+@app.post("/webhook/json", response_model=WebhookResponse)
+def handle_webhook_json(payload: WebhookInput):
+    """
+    Endpoint alternativo que devuelve el JSON completo (por si lo necesitas).
+    """
+    logger.info(f"🎯 Webhook JSON recibido para: {payload.email}")
     
     account = get_account(payload.email)
     if not account:
