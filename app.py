@@ -11,7 +11,6 @@ from email.utils import parsedate_to_datetime
 import psycopg2
 from psycopg2.extras import RealDictCursor
 from fastapi import FastAPI, HTTPException
-from fastapi.responses import PlainTextResponse
 from pydantic import BaseModel
 
 # Configura logging
@@ -48,6 +47,12 @@ class Message(BaseModel):
 class WebhookResponse(BaseModel):
     email: str
     messages: List[Message]
+
+
+class SimpleResponse(BaseModel):
+    otp_code: Optional[str] = None
+    activation_url: Optional[str] = None
+    error: Optional[str] = None
 
 
 # ------- HELPERS DB -------
@@ -512,22 +517,20 @@ def home():
     return {"status": "ok", "mensaje": "FastAPI + Supabase + iCloud listo"}
 
 
-@app.post("/webhook", response_class=PlainTextResponse)
+@app.post("/webhook", response_model=SimpleResponse)
 def handle_webhook(payload: WebhookInput):
     """
-    Webhook que devuelve SOLO el código OTP o URL como texto plano.
-    Respuestas posibles:
-    - "276388" (código OTP de FIFA)
-    - "https://rwc2027.tmtickets.co.uk/..." (URL de Rugby)
-    - "ERROR: No se encontraron mensajes"
-    - "ERROR: Cuenta no encontrada"
+    Webhook que devuelve JSON simple:
+    - {"otp_code": "276388"} para FIFA
+    - {"activation_url": "https://..."} para Rugby
+    - {"error": "mensaje de error"} si hay error
     """
     logger.info(f"🎯 Webhook recibido para: {payload.email}")
     
     account = get_account(payload.email)
     if not account:
         logger.error(f"❌ Cuenta no encontrada")
-        return "ERROR: Cuenta no encontrada"
+        return SimpleResponse(error="Cuenta no encontrada")
 
     icloud_user = account["icloud_user"]
     icloud_pass = account["icloud_app_password"]
@@ -546,7 +549,7 @@ def handle_webhook(payload: WebhookInput):
         
         # Si no hay mensajes
         if not messages:
-            return "ERROR: No se encontraron mensajes"
+            return SimpleResponse(error="No se encontraron mensajes")
         
         # Obtener el primer mensaje
         msg = messages[0]
@@ -554,27 +557,27 @@ def handle_webhook(payload: WebhookInput):
         # Si es FIFA, devolver el código OTP
         if msg.otp_code:
             logger.info(f"🎉 Devolviendo OTP: {msg.otp_code}")
-            return msg.otp_code
+            return SimpleResponse(otp_code=msg.otp_code)
         
         # Si es Rugby, devolver la URL
         if msg.activation_url:
             logger.info(f"🎉 Devolviendo URL: {msg.activation_url}")
-            return msg.activation_url
+            return SimpleResponse(activation_url=msg.activation_url)
         
         # Si no tiene ni OTP ni URL
-        return "ERROR: Mensaje encontrado pero sin código ni URL"
+        return SimpleResponse(error="Mensaje encontrado pero sin código ni URL")
         
     except Exception as e:
         logger.error(f"❌ Error: {e}")
-        return f"ERROR: {str(e)}"
+        return SimpleResponse(error=str(e))
 
 
-@app.post("/webhook/json", response_model=WebhookResponse)
-def handle_webhook_json(payload: WebhookInput):
+@app.post("/webhook/full", response_model=WebhookResponse)
+def handle_webhook_full(payload: WebhookInput):
     """
     Endpoint alternativo que devuelve el JSON completo (por si lo necesitas).
     """
-    logger.info(f"🎯 Webhook JSON recibido para: {payload.email}")
+    logger.info(f"🎯 Webhook FULL recibido para: {payload.email}")
     
     account = get_account(payload.email)
     if not account:
